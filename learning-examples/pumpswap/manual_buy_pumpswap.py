@@ -23,10 +23,13 @@ from solders.instruction import AccountMeta, Instruction
 from solders.keypair import Keypair
 from solders.message import Message
 from solders.pubkey import Pubkey
+from solders.system_program import TransferParams, transfer
 from solders.transaction import VersionedTransaction
 from spl.token.instructions import (
+    SyncNativeParams,
     create_idempotent_associated_token_account,
     get_associated_token_address,
+    sync_native,
 )
 
 load_dotenv()
@@ -53,7 +56,7 @@ SYSTEM_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM = Pubkey.from_string("ATokenGPvbdGVxr1b2
 PUMP_SWAP_EVENT_AUTHORITY = Pubkey.from_string("GS4CU59F31iL7aR2Q8zVS8DRrcRnXX1yjQ66TqNVQnaR")
 LAMPORTS_PER_SOL = 1_000_000_000
 COMPUTE_UNIT_PRICE = 10_000  # Price in micro-lamports per compute unit
-COMPUTE_UNIT_BUDGET = 100_000  # Maximum compute units to use
+COMPUTE_UNIT_BUDGET = 200_000  # Maximum compute units to use
 
 
 async def get_market_address_by_base_mint(client: AsyncClient, base_mint_address: Pubkey, amm_program_id: Pubkey) -> Pubkey:
@@ -162,6 +165,44 @@ def find_coin_creator_vault(coin_creator: Pubkey) -> Pubkey:
         )
     return derived_address
 
+def find_global_volume_accumulator() -> Pubkey:
+    """Derive the Program Derived Address (PDA) for the global volume accumulator.
+    
+    Calculates the deterministic PDA that tracks global trading volume
+    across all pools in the PUMP AMM protocol.
+    
+    Returns:
+        Pubkey of the derived global volume accumulator account
+    """
+    derived_address, _ = Pubkey.find_program_address(
+        [
+            b"global_volume_accumulator"
+        ],
+        PUMP_AMM_PROGRAM_ID,
+    )
+    return derived_address
+
+def find_user_volume_accumulator(user: Pubkey) -> Pubkey:
+    """Derive the Program Derived Address (PDA) for a user's volume accumulator.
+    
+    Calculates the deterministic PDA that tracks trading volume
+    for a specific user in the PUMP AMM protocol.
+    
+    Args:
+        user: Pubkey of the user account
+        
+    Returns:
+        Pubkey of the derived user volume accumulator account
+    """
+    derived_address, _ = Pubkey.find_program_address(
+        [
+            b"user_volume_accumulator",
+            bytes(user)
+        ],
+        PUMP_AMM_PROGRAM_ID,
+    )
+    return derived_address
+
 async def calculate_token_pool_price(client: AsyncClient, pool_base_token_account: Pubkey, pool_quote_token_account: Pubkey) -> float:
     """Calculate the current price of tokens in an AMM pool.
     
@@ -226,6 +267,10 @@ async def buy_pump_swap(client: AsyncClient, pump_fun_amm_market: Pubkey, payer:
     print(f"Buying {base_amount_out / (10**TOKEN_DECIMALS):.10f} tokens")
     print(f"Maximum SOL input: {max_sol_input / LAMPORTS_PER_SOL:.10f} SOL")
 
+    # Calculate required PDAs for volume tracking
+    global_volume_accumulator = find_global_volume_accumulator()
+    user_volume_accumulator = find_user_volume_accumulator(payer.pubkey())
+
     # Define all accounts needed for the buy instruction
     accounts = [
             AccountMeta(pubkey=pump_fun_amm_market, is_signer=False, is_writable=False),
@@ -247,13 +292,41 @@ async def buy_pump_swap(client: AsyncClient, pump_fun_amm_market: Pubkey, payer:
             AccountMeta(pubkey=PUMP_AMM_PROGRAM_ID, is_signer=False, is_writable=False),
             AccountMeta(pubkey=coin_creator_vault_ata, is_signer=False, is_writable=True),
             AccountMeta(pubkey=coin_creator_vault_authority, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=global_volume_accumulator, is_signer=False, is_writable=True),
+            AccountMeta(pubkey=user_volume_accumulator, is_signer=False, is_writable=True),
     ]
     
     data = BUY_DISCRIMINATOR + struct.pack("<Q", base_amount_out) + struct.pack("<Q", max_sol_input)
 
     compute_limit_ix = set_compute_unit_limit(COMPUTE_UNIT_BUDGET)
     compute_price_ix = set_compute_unit_price(COMPUTE_UNIT_PRICE)
-
+    
+    # Wrapping SOL
+    create_wsol_ata_ix = create_idempotent_associated_token_account(
+        payer.pubkey(),
+        payer.pubkey(),
+        SOL,
+        SYSTEM_TOKEN_PROGRAM
+    )
+    
+    # Calculate the amount of SOL to wrap(can also use `max_sol_input`), can get the SOL back by closing the WSOL account while selling
+    pump_protocol_fees = sol_amount_to_spend * 0.1 # adding some buffer fees
+    wrap_amount = int((sol_amount_to_spend + pump_protocol_fees) * LAMPORTS_PER_SOL)
+    
+    transfer_sol_ix = transfer(
+        TransferParams(
+            from_pubkey=payer.pubkey(),
+            to_pubkey=user_quote_token_account,
+            lamports=wrap_amount
+        )
+    )
+    
+    sync_native_ix = sync_native(
+        SyncNativeParams(
+            SYSTEM_TOKEN_PROGRAM, user_quote_token_account
+        )
+    )
+    
     idempotent_ata_ix = create_idempotent_associated_token_account(
         payer.pubkey(),
         payer.pubkey(),
@@ -267,7 +340,7 @@ async def buy_pump_swap(client: AsyncClient, pump_fun_amm_market: Pubkey, payer:
     recent_blockhash = blockhash_resp.value.blockhash
 
     msg = Message.new_with_blockhash(
-        [compute_limit_ix, compute_price_ix, idempotent_ata_ix, buy_ix],
+        [compute_limit_ix, compute_price_ix, create_wsol_ata_ix, transfer_sol_ix, sync_native_ix, idempotent_ata_ix, buy_ix],
         payer.pubkey(),
         recent_blockhash
     )
@@ -276,6 +349,15 @@ async def buy_pump_swap(client: AsyncClient, pump_fun_amm_market: Pubkey, payer:
         message=msg,
         keypairs=[payer]
     )
+    
+    # Optionally, you can simulate the transaction first and check for errors and get the compute units used
+    simulation = await client.simulate_transaction(tx_buy)
+    if simulation.value.err:
+        print(f"Simulation error: {simulation.value.err}")
+        return None
+    
+    compute_units_used = simulation.value.units_consumed
+    print(f"Simulation successful, compute units used: {compute_units_used}")
     
     try:
         tx_sig = await client.send_transaction(
